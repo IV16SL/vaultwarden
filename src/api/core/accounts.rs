@@ -50,7 +50,6 @@ pub fn routes() -> Vec<rocket::Route> {
         api_key,
         rotate_api_key,
         get_known_device,
-        get_known_device_from_path,
         put_avatar,
         put_device_token,
         put_clear_device_token,
@@ -166,7 +165,8 @@ pub async fn _register(data: JsonUpcase<RegisterData>, mut conn: DbConn) -> Json
                 }
                 user
             } else if CONFIG.is_signup_allowed(&email)
-                || EmergencyAccess::find_invited_by_grantee_email(&email, &mut conn).await.is_some()
+                || (CONFIG.emergency_access_allowed()
+                    && EmergencyAccess::find_invited_by_grantee_email(&email, &mut conn).await.is_some())
             {
                 user
             } else {
@@ -217,7 +217,6 @@ pub async fn _register(data: JsonUpcase<RegisterData>, mut conn: DbConn) -> Json
             if let Err(e) = mail::send_welcome_must_verify(&user.email, &user.uuid).await {
                 error!("Error sending welcome email: {:#?}", e);
             }
-
             user.last_verifying_at = Some(user.created_at);
         } else if let Err(e) = mail::send_welcome(&user.email).await {
             error!("Error sending welcome email: {:#?}", e);
@@ -229,6 +228,14 @@ pub async fn _register(data: JsonUpcase<RegisterData>, mut conn: DbConn) -> Json
     }
 
     user.save(&mut conn).await?;
+
+    // accept any open emergency access invitations
+    if !CONFIG.mail_enabled() && CONFIG.emergency_access_allowed() {
+        for mut emergency_invite in EmergencyAccess::find_all_invited_by_grantee_email(&user.email, &mut conn).await {
+            let _ = emergency_invite.accept_invite(&user.uuid, &user.email, &mut conn).await;
+        }
+    }
+
     Ok(Json(json!({
       "Object": "register",
       "CaptchaBypassToken": "",
@@ -568,7 +575,7 @@ async fn post_rotatekey(data: JsonUpcase<KeyData>, headers: Headers, mut conn: D
             // Prevent triggering cipher updates via WebSockets by settings UpdateType::None
             // The user sessions are invalidated because all the ciphers were re-encrypted and thus triggering an update could cause issues.
             // We force the users to logout after the user has been saved to try and prevent these issues.
-            update_cipher_from_data(&mut saved_cipher, cipher_data, &headers, false, &mut conn, &nt, UpdateType::None)
+            update_cipher_from_data(&mut saved_cipher, cipher_data, &headers, None, &mut conn, &nt, UpdateType::None)
                 .await?
         }
     }
@@ -971,20 +978,13 @@ async fn rotate_api_key(data: JsonUpcase<PasswordOrOtpData>, headers: Headers, c
     _api_key(data, true, headers, conn).await
 }
 
-// This variant is deprecated: https://github.com/bitwarden/server/pull/2682
-#[get("/devices/knowndevice/<email>/<uuid>")]
-async fn get_known_device_from_path(email: &str, uuid: &str, mut conn: DbConn) -> JsonResult {
-    // This endpoint doesn't have auth header
+#[get("/devices/knowndevice")]
+async fn get_known_device(device: KnownDevice, mut conn: DbConn) -> JsonResult {
     let mut result = false;
-    if let Some(user) = User::find_by_mail(email, &mut conn).await {
-        result = Device::find_by_uuid_and_user(uuid, &user.uuid, &mut conn).await.is_some();
+    if let Some(user) = User::find_by_mail(&device.email, &mut conn).await {
+        result = Device::find_by_uuid_and_user(&device.uuid, &user.uuid, &mut conn).await.is_some();
     }
     Ok(Json(json!(result)))
-}
-
-#[get("/devices/knowndevice")]
-async fn get_known_device(device: KnownDevice, conn: DbConn) -> JsonResult {
-    get_known_device_from_path(&device.email, &device.uuid, conn).await
 }
 
 struct KnownDevice {
