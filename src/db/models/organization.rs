@@ -55,11 +55,25 @@ db_object! {
 }
 
 // https://github.com/bitwarden/server/blob/b86a04cef9f1e1b82cf18e49fc94e017c641130c/src/Core/Enums/OrganizationUserStatusType.cs
+#[derive(PartialEq)]
 pub enum MembershipStatus {
     Revoked = -1,
     Invited = 0,
     Accepted = 1,
     Confirmed = 2,
+}
+
+impl MembershipStatus {
+    pub fn from_i32(status: i32) -> Option<Self> {
+        match status {
+            0 => Some(Self::Invited),
+            1 => Some(Self::Accepted),
+            2 => Some(Self::Confirmed),
+            // NOTE: we don't care about revoked members where this is used
+            // if this ever changes also adapt the OrgHeaders check.
+            _ => None,
+        }
+    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, num_derive::FromPrimitive)]
@@ -87,7 +101,7 @@ impl MembershipType {
 impl Ord for MembershipType {
     fn cmp(&self, other: &MembershipType) -> Ordering {
         // For easy comparison, map each variant to an access level (where 0 is lowest).
-        static ACCESS_LEVEL: [i32; 4] = [
+        const ACCESS_LEVEL: [i32; 4] = [
             3, // Owner
             2, // Admin
             0, // User
@@ -152,6 +166,7 @@ impl PartialOrd<MembershipType> for i32 {
 /// Local methods
 impl Organization {
     pub fn new(name: String, billing_email: String, private_key: Option<String>, public_key: Option<String>) -> Self {
+        let billing_email = billing_email.to_lowercase();
         Self {
             uuid: OrganizationId(crate::util::get_uuid()),
             name,
@@ -216,7 +231,7 @@ impl Organization {
 // The number 128 should be fine, it is well within the range of an i32
 // The same goes for the database where we only use INTEGER (the same as an i32)
 // It should also provide enough room for 100+ types, which i doubt will ever happen.
-static ACTIVATE_REVOKE_DIFF: i32 = 128;
+const ACTIVATE_REVOKE_DIFF: i32 = 128;
 
 impl Membership {
     pub fn new(user_uuid: UserId, org_uuid: OrganizationId) -> Self {
@@ -307,8 +322,8 @@ use crate::error::MapResult;
 /// Database methods
 impl Organization {
     pub async fn save(&self, conn: &mut DbConn) -> EmptyResult {
-        if !email_address::EmailAddress::is_valid(self.billing_email.trim()) {
-            err!(format!("BillingEmail {} is not a valid email address", self.billing_email.trim()))
+        if !crate::util::is_valid_email(&self.billing_email) {
+            err!(format!("BillingEmail {} is not a valid email address", self.billing_email))
         }
 
         for member in Membership::find_by_org(&self.uuid, conn).await.iter() {
@@ -449,7 +464,7 @@ impl Membership {
             "familySponsorshipValidUntil": null,
             "familySponsorshipToDelete": null,
             "accessSecretsManager": false,
-            "limitCollectionCreation": true,
+            "limitCollectionCreation": self.atype < MembershipType::Manager, // If less then a manager return true, to limit collection creations
             "limitCollectionCreationDeletion": true,
             "limitCollectionDeletion": true,
             "allowAdminAccessToAllCollectionItems": true,
@@ -522,13 +537,13 @@ impl Membership {
                 .await
                 .into_iter()
                 .filter_map(|c| {
-                    let (read_only, hide_passwords, can_manage) = if self.has_full_access() {
+                    let (read_only, hide_passwords, manage) = if self.has_full_access() {
                         (false, false, self.atype >= MembershipType::Manager)
                     } else if let Some(cu) = cu.get(&c.uuid) {
                         (
                             cu.read_only,
                             cu.hide_passwords,
-                            self.atype == MembershipType::Manager && !cu.read_only && !cu.hide_passwords,
+                            cu.manage || (self.atype == MembershipType::Manager && !cu.read_only && !cu.hide_passwords),
                         )
                     // If previous checks failed it might be that this user has access via a group, but we should not return those elements here
                     // Those are returned via a special group endpoint
@@ -542,7 +557,7 @@ impl Membership {
                         "id": c.uuid,
                         "readOnly": read_only,
                         "hidePasswords": hide_passwords,
-                        "manage": can_manage,
+                        "manage": manage,
                     }))
                 })
                 .collect()
@@ -611,6 +626,7 @@ impl Membership {
             "id": self.uuid,
             "readOnly": col_user.read_only,
             "hidePasswords": col_user.hide_passwords,
+            "manage": col_user.manage,
         })
     }
 
@@ -622,11 +638,12 @@ impl Membership {
                 CollectionUser::find_by_organization_and_user_uuid(&self.org_uuid, &self.user_uuid, conn).await;
             collections
                 .iter()
-                .map(|c| {
+                .map(|cu| {
                     json!({
-                        "id": c.collection_uuid,
-                        "readOnly": c.read_only,
-                        "hidePasswords": c.hide_passwords,
+                        "id": cu.collection_uuid,
+                        "readOnly": cu.read_only,
+                        "hidePasswords": cu.hide_passwords,
+                        "manage": cu.manage,
                     })
                 })
                 .collect()
